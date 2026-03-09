@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy matplotlib pytest
+      - name: Test CustomCNN architecture
+        run: python -c "
+import torch, sys
+sys.path.insert(0, '.')
+from model import CustomCNN
+
+model = CustomCNN(num_classes=10, dropout_rate=0.5)
+x = torch.randn(4, 3, 32, 32)
+out = model(x)
+assert out.shape == (4, 10), f'Wrong output shape: {out.shape}'
+params = model.get_num_parameters()
+assert 2_000_000 < params < 5_000_000, f'Unexpected param count: {params}'
+print(f'CustomCNN OK | output={out.shape} | params={params:,}')
+"
+      - name: Test weight initialization
+        run: python -c "
+import torch, sys
+sys.path.insert(0, '.')
+from model import CustomCNN
+
+model = CustomCNN(num_classes=10)
+# Check Kaiming init: variance should be ~2/fan_in for conv layers
+conv1_var = model.conv1.weight.data.var().item()
+fan_in = 3 * 3 * 3  # 3 input channels, 3x3 kernel
+expected_var = 2.0 / fan_in
+# Should be within factor of 3
+assert abs(conv1_var - expected_var) < expected_var * 3, \
+    f'Conv1 variance {conv1_var:.4f} far from expected {expected_var:.4f}'
+print(f'Weight init OK | conv1 var={conv1_var:.4f}, expected~{expected_var:.4f}')
+"
+      - name: Test forward pass gradient flow
+        run: python -c "
+import torch, sys
+sys.path.insert(0, '.')
+from model import CustomCNN
+
+model = CustomCNN(num_classes=10)
+x = torch.randn(2, 3, 32, 32, requires_grad=False)
+out = model(x)
+loss = out.sum()
+loss.backward()
+# Check that gradients flow to first conv layer
+assert model.conv1.weight.grad is not None, 'No gradient at conv1!'
+assert not torch.isnan(model.conv1.weight.grad).any(), 'NaN gradient at conv1!'
+print('Gradient flow OK through all layers')
+"
+      - name: Lint (errors only)
+        run: |
+          pip install flake8
+          flake8 model.py train.py inference.py dataset.py utils.py scripts/ --max-line-length=120 --select=E9,F63,F7,F82
+
+  generate-plots:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy matplotlib
+      - run: python scripts/generate_cnn_plots.py --out docs/images/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cnn-demo-plots
+          path: docs/images/
+          retention-days: 30
